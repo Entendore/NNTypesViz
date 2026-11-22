@@ -1,0 +1,1250 @@
+"""
+FNO Studio — interactive Fourier Neural Operator workbench.
+
+Run:  python fno_studio.py
+Optional: pip install torch  (enables real training; otherwise synthetic demo mode)
+"""
+from __future__ import annotations
+
+import copy
+import json
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+import matplotlib
+matplotlib.use("QtAgg")
+import matplotlib.pyplot as plt  # noqa: F401  (registers colormaps)
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+from matplotlib.patches import Rectangle
+
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSettings
+from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
+    QGridLayout, QComboBox, QSlider, QLabel, QPushButton, QGroupBox, QSplitter,
+    QTabWidget, QScrollArea, QSpinBox, QDoubleSpinBox, QCheckBox, QProgressBar,
+    QPlainTextEdit, QToolBar, QStatusBar, QFileDialog, QMessageBox,
+    QAbstractSpinBox, QSizePolicy,
+)
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+matplotlib.rcParams["font.size"] = 9
+matplotlib.rcParams["axes.titlesize"] = 10
+
+
+# ============================================================================
+# 1. NUMERICS — a band-limited periodic operator, resolvable at ANY grid size
+# ============================================================================
+
+@dataclass
+class Sample:
+    a: np.ndarray   # input coefficient field
+    u: np.ndarray   # target solution field
+
+
+class SyntheticOperator:
+    """
+    u = L(a) + 0.15 * L2(a * a),   L = (1 + 0.12 * |k|^2)^-1
+
+    Coefficients are generated in a fixed integer wavenumber band, so sampling
+    the SAME continuous function at N=32, 64 or 128 is exact. This makes the
+    resolution-invariance demonstration genuine.
+    """
+
+    def __init__(self, kmax: int = 8):
+        self.kmax = kmax
+
+    def sample(self, seed: int, n: int) -> Sample:
+        rng = np.random.default_rng(seed)
+        ks = np.fft.fftfreq(n, d=1.0 / n).astype(int)
+        KX, KY = np.meshgrid(ks, ks)
+        K2 = KX ** 2 + KY ** 2
+
+        ah = np.zeros((n, n), dtype=complex)
+        for kx in range(-self.kmax, self.kmax + 1):
+            for ky in range(-self.kmax, self.kmax + 1):
+                if kx == 0 and ky == 0:
+                    continue
+                c = (rng.normal() + 1j * rng.normal()) / (1 + np.hypot(kx, ky)) ** 1.6
+                ah[kx % n, ky % n] += c
+
+        a = np.fft.ifft2(ah).real
+        a = (a - a.mean()) / (a.std() + 1e-8)
+
+        u = np.fft.ifft2(np.fft.fft2(a) / (1 + 0.12 * K2)).real
+        u += 0.15 * np.fft.ifft2(np.fft.fft2(a * a) / (1 + 0.20 * K2)).real
+        u = (u - u.mean()) / (u.std() + 1e-8)
+        return Sample(a, u)
+
+
+def mock_predict(a: np.ndarray, keep: int) -> np.ndarray:
+    """Demo 'model': learns only the linear part, with a hard mode cutoff."""
+    n = a.shape[0]
+    ks = np.fft.fftfreq(n, d=1.0 / n).astype(int)
+    KX, KY = np.meshgrid(ks, ks)
+    mask = (np.abs(KX) <= keep) & (np.abs(KY) <= keep)
+    uh = np.fft.fft2(a) / (1 + 0.12 * (KX ** 2 + KY ** 2)) * mask
+    return np.fft.ifft2(uh).real
+
+
+def mode_mask(n: int, keep: int) -> np.ndarray:
+    ks = np.fft.fftfreq(n, d=1.0 / n).astype(int)
+    KX, KY = np.meshgrid(ks, ks)
+    return (np.abs(KX) <= keep) & (np.abs(KY) <= keep)
+
+
+def metrics(u: np.ndarray, p: np.ndarray, keep: int) -> dict[str, float]:
+    err = u - p
+    mse = float(np.mean(err ** 2))
+    uh = np.fft.fft2(u)
+    mask = mode_mask(u.shape[0], keep)
+    energy = float(np.sum(np.abs(uh[mask]) ** 2) / (np.sum(np.abs(uh) ** 2) + 1e-12))
+    return {
+        "L1": float(np.mean(np.abs(err))),
+        "L2": float(np.sqrt(mse)),
+        "Rel L2": float(np.linalg.norm(err) / (np.linalg.norm(u) + 1e-12)),
+        "Max": float(np.max(np.abs(err))),
+        "PSNR": float(10 * np.log10((np.ptp(u) ** 2) / (mse + 1e-12))),
+        "Energy": energy,
+    }
+
+
+# ============================================================================
+# 2. REAL FNO (optional backend)
+# ============================================================================
+
+if HAS_TORCH:
+
+    class SpectralConv2d(nn.Module):
+        """Multiplication by a learnable complex kernel on the lowest modes."""
+
+        def __init__(self, width: int, modes: int):
+            super().__init__()
+            self.modes = modes
+            scale = 1.0 / (width * width)
+            shape = (width, width, modes, modes + 1)
+            self.w1 = nn.Parameter(scale * torch.rand(shape, dtype=torch.cfloat))
+            self.w2 = nn.Parameter(scale * torch.rand(shape, dtype=torch.cfloat))
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            b, _, h, w = x.shape
+            xf = torch.fft.rfft2(x)
+            of = torch.zeros(
+                b, self.w1.shape[1], h, w // 2 + 1,
+                dtype=torch.cfloat, device=x.device,
+            )
+            # non-negative ky branch
+            of[:, :, :self.modes, :self.modes + 1] = torch.einsum(
+                "bixy,ioxy->boxy", xf[:, :, :self.modes, :self.modes + 1], self.w1
+            )
+            # negative ky branch
+            of[:, :, -self.modes:, :self.modes + 1] = torch.einsum(
+                "bixy,ioxy->boxy", xf[:, :, -self.modes:, :self.modes + 1], self.w2
+            )
+            return torch.fft.irfft2(of, s=(h, w))
+
+    class FNO2d(nn.Module):
+        def __init__(self, width: int = 16, modes: int = 8, layers: int = 4):
+            super().__init__()
+            self.width, self.modes, self.n_layers = width, modes, layers
+            self.lift = nn.Conv2d(3, width, 1)
+            self.spectral = nn.ModuleList(
+                [SpectralConv2d(width, modes) for _ in range(layers)]
+            )
+            self.skips = nn.ModuleList(
+                [nn.Conv2d(width, width, 1) for _ in range(layers)]
+            )
+            self.proj1 = nn.Conv2d(width, width, 1)
+            self.proj2 = nn.Conv2d(width, 1, 1)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = self.lift(x)
+            for sp, sk in zip(self.spectral, self.skips):
+                x = F.gelu(sp(x) + sk(x))
+            x = F.gelu(self.proj1(x))
+            return self.proj2(x)
+
+    def prune_modes(model: "FNO2d", keep: int) -> "FNO2d":
+        """Return a copy whose spectral kernels only retain |kx|,|ky| <= keep."""
+        m = copy.deepcopy(model).eval()
+        with torch.no_grad():
+            for layer in m.spectral:
+                M = layer.modes
+                layer.w1[:, :, min(keep + 1, M):, :] = 0
+                layer.w1[:, :, :, keep + 1:] = 0
+                layer.w2[:, :, :M - keep, :] = 0
+                layer.w2[:, :, :, keep + 1:] = 0
+        return m
+
+    def make_input(a: np.ndarray) -> torch.Tensor:
+        """Append (x, y) coordinate channels, matching training conventions."""
+        n = a.shape[-1]
+        g = np.linspace(0, 1, n, endpoint=False)
+        X, Y = np.meshgrid(g, g)
+        coords = torch.from_numpy(np.stack([X, Y])[None]).float()
+        return torch.cat([torch.from_numpy(a).float(), coords], dim=1).unsqueeze(0)
+
+
+class TrainingWorker(QThread):
+    progress = Signal(int, float, float)
+    snapshot = Signal(object)
+    log = Signal(str)
+    done = Signal(str)
+
+    def __init__(self, cfg: dict, op: SyntheticOperator):
+        super().__init__()
+        self.cfg = dict(cfg)
+        self.op = op
+        self._stop = False
+
+    def request_stop(self):
+        self._stop = True
+
+    def _dataset(self, seed: int, count: int, n: int, device: str):
+        aa, uu = [], []
+        for i in range(count):
+            s = self.op.sample(seed + i, n)
+            aa.append(s.a)
+            uu.append(s.u)
+        a = torch.from_numpy(np.stack(aa)[:, None]).float()
+        u = torch.from_numpy(np.stack(uu)[:, None]).float()
+        g = np.linspace(0, 1, n, endpoint=False)
+        X, Y = np.meshgrid(g, g)
+        coords = torch.from_numpy(np.stack([X, Y])[None]).float().expand(count, 2, n, n)
+        x = torch.cat([a, coords], dim=1).to(device)
+        return x, u.to(device)
+
+    def run(self):
+        try:
+            c = self.cfg
+            dev = c["device"]
+            if dev in ("Auto", "CUDA"):
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            else:
+                device = "cpu"
+            torch.manual_seed(c["seed"])
+
+            model = FNO2d(c["width"], c["modes"], c["layers"]).to(device)
+            model._fno_cfg = {k: c[k] for k in ("width", "modes", "layers")}
+            self.snapshot.emit(copy.deepcopy(model).cpu().eval())
+            self.log.emit(f"Device: {device} | width={c['width']} modes={c['modes']} "
+                          f"layers={c['layers']} train_N={c['train_n']}")
+
+            xtr, ytr = self._dataset(1000, c["train_size"], c["train_n"], device)
+            xva, yva = self._dataset(9000, c["val_size"], c["train_n"], device)
+
+            opt = torch.optim.Adam(model.parameters(), lr=c["lr"], weight_decay=1e-5)
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=c["epochs"])
+            best, best_model = float("inf"), None
+
+            for epoch in range(1, c["epochs"] + 1):
+                if self._stop:
+                    break
+                model.train()
+                perm = torch.randperm(xtr.shape[0], device=device)
+                total = 0.0
+                for start in range(0, xtr.shape[0], c["batch"]):
+                    if self._stop:
+                        break
+                    idx = perm[start:start + c["batch"]]
+                    loss = F.mse_loss(model(xtr[idx]), ytr[idx])
+                    opt.zero_grad(set_to_none=True)
+                    loss.backward()
+                    opt.step()
+                    total += loss.item() * idx.numel()
+                train_loss = total / xtr.shape[0]
+
+                model.eval()
+                with torch.no_grad():
+                    val_loss = F.mse_loss(model(xva), yva).item()
+                sched.step()
+
+                self.progress.emit(epoch, train_loss, val_loss)
+                if val_loss < best:
+                    best = val_loss
+                    best_model = copy.deepcopy(model).cpu().eval()
+                if epoch % 2 == 0 or epoch == c["epochs"]:
+                    self.snapshot.emit(copy.deepcopy(model).cpu().eval())
+                if epoch % 5 == 0 or epoch == 1:
+                    self.log.emit(f"epoch {epoch:3d}  train={train_loss:.5f}  "
+                                  f"val={val_loss:.5f}  best={best:.5f}")
+
+            if best_model is not None:
+                best_model._fno_cfg = model._fno_cfg
+                self.snapshot.emit(best_model)
+                self.log.emit(f"Restored best checkpoint (val MSE = {best:.6f})")
+            self.done.emit("stopped" if self._stop else "complete")
+        except Exception as exc:
+            self.log.emit(f"Training error: {exc}")
+            self.done.emit("failed")
+
+
+# ============================================================================
+# 3. MATPLOTLIB PANELS
+# ============================================================================
+
+def style_figure(fig: Figure, dark: bool):
+    bg = "#1e1f22" if dark else "#ffffff"
+    fg = "#e6e6e6" if dark else "#202124"
+    grid = "#3a3d42" if dark else "#dcdcdc"
+    fig.set_facecolor(bg)
+    for ax in fig.axes:
+        ax.set_facecolor(bg)
+        ax.tick_params(colors=fg, labelsize=8)
+        ax.title.set_color(fg)
+        ax.xaxis.label.set_color(fg)
+        ax.yaxis.label.set_color(fg)
+        for spine in ax.spines.values():
+            spine.set_color(grid)
+        ax.grid(color=grid, lw=0.5, alpha=0.6)
+
+
+class BaseCanvas(FigureCanvas):
+    def __init__(self, figsize=(5, 4)):
+        self.fig = Figure(figsize=figsize, dpi=100, constrained_layout=True)
+        super().__init__(self.fig)
+        self.setMinimumHeight(140)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def restyle(self, dark: bool):
+        style_figure(self.fig, dark)
+        self.draw_idle()
+
+
+class FieldCanvas(BaseCanvas):
+    def __init__(self):
+        super().__init__((7, 7))
+        self.quad = False
+        self._build(False)
+
+    def _build(self, quad: bool):
+        self.fig.clear()
+        self.quad = quad
+        self.axes = (list(self.fig.subplots(2, 2).ravel()) if quad
+                     else [self.fig.add_subplot(111)])
+        self.images, self.bars, self.cross = [], [], []
+        for ax in self.axes:
+            im = ax.imshow(np.zeros((2, 2)), cmap="viridis", origin="lower",
+                           extent=[0, 1, 0, 1])
+            self.images.append(im)
+            self.bars.append(self.fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04))
+            vx = ax.axvline(0.5, color="white", lw=0.9, ls=":")
+            hy = ax.axhline(0.5, color="white", lw=0.9, ls=":")
+            vx.set_visible(False)
+            hy.set_visible(False)
+            self.cross.append((vx, hy))
+            ax.set_xlabel("x")
+            ax.set_ylabel("y")
+
+    def set_quad(self, quad: bool, dark: bool):
+        if quad != self.quad:
+            self._build(quad)
+            style_figure(self.fig, dark)
+
+    def paint(self, fields, titles, cmaps, cursor, n):
+        for i, (ax, im) in enumerate(zip(self.axes, self.images)):
+            data = fields[i]
+            im.set_data(data)
+            im.set_cmap(cmaps[i])
+            im.set_clim(data.min(), data.max())
+            ax.set_title(titles[i], fontweight="bold")
+            self.bars[i].update_normal(im)
+            vx, hy = self.cross[i]
+            visible = cursor is not None
+            vx.set_visible(visible)
+            hy.set_visible(visible)
+            if visible:
+                col, row = cursor
+                vx.set_xdata([(col + 0.5) / n, (col + 0.5) / n])
+                hy.set_ydata([(row + 0.5) / n, (row + 0.5) / n])
+        self.draw_idle()
+
+
+class SliceCanvas(BaseCanvas):
+    def __init__(self):
+        super().__init__((7, 3))
+        self.axes = self.fig.subplots(1, 2)
+        self.lines = []
+        for ax in self.axes:
+            ls = [ax.plot([], [], label=t, **kw)[0] for t, kw in [
+                ("input", dict(color="#4dabf7", lw=1.2, alpha=0.8)),
+                ("truth", dict(color="#51cf66", lw=2.0)),
+                ("prediction", dict(color="#ff6b6b", lw=1.6, ls="--")),
+            ]]
+            self.lines.append(ls)
+            ax.legend(fontsize=7, loc="best")
+            ax.grid(True, alpha=0.3)
+
+    def paint(self, sample: Sample, pred: np.ndarray, cursor):
+        n = sample.a.shape[0]
+        t = np.linspace(0, 1, n, endpoint=False)
+        row = n // 2 if cursor is None else cursor[1]
+        col = n // 2 if cursor is None else cursor[0]
+        slices = [
+            (t, [sample.a[row, :], sample.u[row, :], pred[row, :]], f"Horizontal slice  y={t[row]:.3f}"),
+            (t, [sample.a[:, col], sample.u[:, col], pred[:, col]], f"Vertical slice  x={t[col]:.3f}"),
+        ]
+        for ax, lines, (xs, ys, title) in zip(self.axes, self.lines, slices):
+            for line, y in zip(lines, ys):
+                line.set_data(xs, y)
+            all_y = np.concatenate(ys)
+            pad = (all_y.max() - all_y.min()) * 0.12 + 1e-6
+            ax.set_ylim(all_y.min() - pad, all_y.max() + pad)
+            ax.set_title(title, fontsize=9)
+            ax.set_xlabel("coordinate")
+        self.draw_idle()
+
+
+class SpectrumCanvas(BaseCanvas):
+    def __init__(self):
+        super().__init__((5, 4))
+        self.ax = self.fig.add_subplot(111)
+        self.im = self.ax.imshow(np.zeros((2, 2)), cmap="magma", origin="lower")
+        self.bar = self.fig.colorbar(self.im, ax=self.ax, fraction=0.046, pad=0.04)
+        self.box = Rectangle((0, 0), 1, 1, fill=False, edgecolor="#63e6be", lw=1.6)
+        self.ax.add_patch(self.box)
+        self.ax.set_title("Fourier spectrum", fontweight="bold")
+
+    def paint(self, field: np.ndarray, keep: int, component: str, logscale: bool):
+        F = np.fft.fftshift(np.fft.fft2(field))
+        if component == "Phase":
+            data, cmap, clim = np.angle(F), "hsv", (-np.pi, np.pi)
+        else:
+            data = {"Amplitude": np.abs(F), "Real": F.real, "Imag": F.imag}[component]
+            if logscale and component == "Amplitude":
+                data = np.log1p(data)
+            cmap = "magma"
+            clim = (data.min(), data.max())
+        self.im.set_data(data)
+        self.im.set_cmap(cmap)
+        self.im.set_clim(*clim)
+        self.bar.update_normal(self.im)
+
+        n = field.shape[0]
+        c = n / 2
+        self.box.set_xy((c - keep - 0.5, c - keep - 0.5))
+        self.box.set_width(2 * keep + 1)
+        self.box.set_height(2 * keep + 1)
+        self.ax.set_title(f"Spectrum — retained |k| ≤ {keep}", fontweight="bold")
+        self.draw_idle()
+
+
+class HistCanvas(BaseCanvas):
+    def __init__(self):
+        super().__init__((5, 3))
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_title("Pointwise error distribution", fontweight="bold")
+        self.ax.set_xlabel("|error|")
+        self.ax.set_ylabel("count")
+
+    def paint(self, error: np.ndarray):
+        self.ax.clear()
+        self.ax.hist(error.ravel(), bins=40, color="#ffa94d", edgecolor="none", alpha=0.85)
+        self.ax.axvline(np.mean(error), color="#ff6b6b", lw=1.5, label="mean")
+        self.ax.set_title("Pointwise error distribution", fontweight="bold")
+        self.ax.set_xlabel("|error|")
+        self.ax.set_ylabel("count")
+        self.ax.legend(fontsize=8)
+        self.draw_idle()
+
+
+class LossCanvas(BaseCanvas):
+    def __init__(self):
+        super().__init__((4, 2.4))
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_yscale("log")
+        self.ax.set_xlabel("epoch")
+        self.ax.set_ylabel("MSE")
+        self.ax.set_title("Training loss", fontweight="bold")
+        self.ax.grid(True, alpha=0.3)
+        self.lt, = self.ax.plot([], [], label="train", color="#4dabf7")
+        self.lv, = self.ax.plot([], [], label="val", color="#51cf66")
+        self.ax.legend(fontsize=8)
+
+    def paint(self, history):
+        if not history:
+            return
+        ep, tr, va = zip(*history)
+        self.lt.set_data(ep, tr)
+        self.lv.set_data(ep, va)
+        self.ax.relim()
+        self.ax.autoscale_view()
+        self.draw_idle()
+
+
+class KernelCanvas(BaseCanvas):
+    def __init__(self):
+        super().__init__((4, 3.4))
+        self.ax = self.fig.add_subplot(111)
+        self.im = self.ax.imshow(np.zeros((2, 2)), cmap="viridis", origin="lower")
+        self.bar = self.fig.colorbar(self.im, ax=self.ax, fraction=0.046, pad=0.04)
+        self.box = Rectangle((0, 0), 1, 1, fill=False, edgecolor="#63e6be", lw=1.6)
+        self.ax.add_patch(self.box)
+        self.ax.set_xlabel("kx  (rfft mode)")
+        self.ax.set_ylabel("ky  (centered)")
+
+    def paint(self, kernel: np.ndarray, M: int, keep: int, title: str, phase: bool):
+        self.im.set_data(kernel)
+        self.im.set_cmap("hsv" if phase else "viridis")
+        self.im.set_clim((-np.pi, np.pi) if phase else (kernel.min(), kernel.max()))
+        self.bar.update_normal(self.im)
+        self.box.set_xy((-0.5, M - keep - 0.5))
+        self.box.set_width(keep + 1)
+        self.box.set_height(2 * keep + 1)
+        self.ax.set_title(title, fontweight="bold", fontsize=9)
+        self.draw_idle()
+
+
+# ============================================================================
+# 4. APPLICATION
+# ============================================================================
+
+LIGHT_QSS = """
+QMainWindow, QWidget { background:#f4f5f7; color:#202124; font-size:12px; }
+QGroupBox { background:#fff; border:1px solid #d7d9de; border-radius:8px;
+            margin-top:10px; padding-top:14px; font-weight:bold; }
+QGroupBox::title { subcontrol-origin:margin; left:10px; padding:0 4px; }
+QPushButton { background:#1971c2; color:white; border:none; padding:7px 10px;
+              border-radius:5px; font-weight:600; }
+QPushButton:hover { background:#1864ab; }
+QPushButton:disabled { background:#adb5bd; }
+QPushButton#secondary { background:#e9ecef; color:#202124; }
+QComboBox, QSpinBox, QDoubleSpinBox { background:#fff; border:1px solid #ced4da;
+                                     border-radius:4px; padding:4px; }
+QTabWidget::pane { border:1px solid #d7d9de; border-radius:6px; background:#fff; }
+QTabBar::tab { padding:7px 14px; background:#e9ecef; border-radius:4px 4px 0 0; }
+QTabBar::tab:selected { background:#1971c2; color:white; }
+QPlainTextEdit { background:#fff; color:#202124; border:1px solid #d7d9de;
+                 border-radius:6px; font-family:monospace; }
+QScrollBar:vertical { background:transparent; width:10px; }
+QScrollBar::handle:vertical { background:#c1c7cf; border-radius:5px; min-height:25px; }
+QSplitter::handle { background:#d7d9de; }
+QStatusBar { background:#e9ecef; }
+"""
+
+DARK_QSS = """
+QMainWindow, QWidget { background:#17181b; color:#e6e6e6; font-size:12px; }
+QGroupBox { background:#1e1f22; border:1px solid #35373c; border-radius:8px;
+            margin-top:10px; padding-top:14px; font-weight:bold; }
+QGroupBox::title { subcontrol-origin:margin; left:10px; padding:0 4px; color:#adb5bd; }
+QPushButton { background:#1c7ed6; color:white; border:none; padding:7px 10px;
+              border-radius:5px; font-weight:600; }
+QPushButton:hover { background:#339af0; }
+QPushButton:disabled { background:#495057; color:#868e96; }
+QPushButton#secondary { background:#343a40; color:#e6e6e6; }
+QComboBox, QSpinBox, QDoubleSpinBox { background:#2b2d31; color:#e6e6e6;
+    border:1px solid #42454a; border-radius:4px; padding:4px; }
+QTabWidget::pane { border:1px solid #35373c; border-radius:6px; background:#1e1f22; }
+QTabBar::tab { padding:7px 14px; background:#2b2d31; color:#ced4da;
+               border-radius:4px 4px 0 0; }
+QTabBar::tab:selected { background:#1c7ed6; color:white; }
+QPlainTextEdit { background:#141518; color:#c3f7cf; border:1px solid #35373c;
+                 border-radius:6px; font-family:monospace; }
+QScrollBar:vertical { background:transparent; width:10px; }
+QScrollBar::handle:vertical { background:#495057; border-radius:5px; min-height:25px; }
+QSplitter::handle { background:#35373c; }
+QStatusBar { background:#222428; }
+"""
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("FNO Studio — Fourier Neural Operator Workbench")
+        self.resize(1560, 940)
+
+        self.settings = QSettings("FNOStudio", "FNOStudio")
+        self.dark = self.settings.value("dark", False, type=bool)
+        self.op = SyntheticOperator()
+        self.model = None
+        self.model_cfg = None
+        self.sample_index = int(self.settings.value("sample", 7))
+        self.resolution = int(self.settings.value("resolution", 64))
+        self.keep = int(self.settings.value("keep", 6))
+        self.cursor = None
+        self.history: list[tuple[int, float, float]] = []
+        self.worker: TrainingWorker | None = None
+        self._closing = False
+
+        self._cache: dict[tuple, tuple[Sample, np.ndarray]] = {}
+        self._prune_cache: dict[tuple, object] = {}
+
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(60)
+        self._refresh_timer.timeout.connect(self.refresh)
+
+        self._sweep_timer = QTimer(self)
+        self._sweep_timer.setInterval(280)
+        self._sweep_timer.timeout.connect(self._sweep_step)
+        self._sweep_dir = 1
+
+        self._build_ui()
+        self._build_actions()
+        self._apply_theme()
+        self._load_settings()
+        self.refresh()
+
+        if not HAS_TORCH:
+            self.log.append("[demo] PyTorch not found — running synthetic operator demo.")
+            self.log.append("[demo] pip install torch to enable real FNO training.")
+        else:
+            self.log.append(f"[torch] {torch.__version__} | "
+                            f"CUDA available: {torch.cuda.is_available()}")
+
+    # ------------------------------------------------------------------ UI
+
+    def _build_ui(self):
+        central = QWidget()
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(8, 8, 8, 8)
+
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.addWidget(self._left_panel())
+        self.splitter.addWidget(self._center_panel())
+        self.splitter.addWidget(self._right_panel())
+        self.splitter.setSizes([285, 780, 380])
+        outer.addWidget(self.splitter)
+        self.setCentralWidget(central)
+
+        self.setStatusBar(QStatusBar())
+        self.statusBar().showMessage("Ready")
+
+        tb = self.addToolBar("Main")
+        tb.setMovable(False)
+        tb.setIconSize(tb.iconSize())
+        for action in (self.act_sample, self.act_quad, self.act_sweep,
+                       self.act_png, self.act_theme):
+            tb.addAction(action)
+
+    def _scroll(self, widget) -> QScrollArea:
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QScrollArea.Shape.NoFrame)
+        area.setWidget(widget)
+        return area
+
+    def _left_panel(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(10)
+
+        # Dataset
+        g = QGroupBox("1 · Dataset")
+        f = QFormLayout(g)
+        self.spin_sample = QSpinBox()
+        self.spin_sample.setRange(0, 9999)
+        self.spin_sample.valueChanged.connect(self._on_sample_changed)
+        self.cmb_resolution = QComboBox()
+        self.cmb_resolution.addItems(["32", "64", "128"])
+        self.cmb_resolution.currentTextChanged.connect(self._on_resolution_changed)
+        self.cmb_resolution.setToolTip(
+            "Evaluate on a finer grid. The operator is band-limited, so this is a "
+            "genuine zero-shot resolution-transfer test for a trained FNO."
+        )
+        btn_random = QPushButton("Random sample")
+        btn_random.setObjectName("secondary")
+        btn_random.clicked.connect(lambda: self.spin_sample.setValue(
+            int(np.random.default_rng().integers(0, 9999))))
+        f.addRow("Sample seed", self.spin_sample)
+        f.addRow("Eval grid", self.cmb_resolution)
+        lay.addWidget(g)
+        lay.addWidget(btn_random)
+
+        # View
+        g = QGroupBox("2 · Field view")
+        f = QFormLayout(g)
+        self.chk_quad = QCheckBox("2 × 2 comparison")
+        self.chk_quad.toggled.connect(self._on_view_changed)
+        self.cmb_var = QComboBox()
+        self.cmb_var.addItems(["Input a(x)", "Truth u(x)", "Prediction", "Absolute error"])
+        self.cmb_var.currentIndexChanged.connect(self._schedule)
+        self.cmb_cmap = QComboBox()
+        self.cmb_cmap.addItems(["viridis", "plasma", "inferno", "magma", "coolwarm", "RdBu", "turbo"])
+        self.cmb_cmap.currentTextChanged.connect(self._schedule)
+        f.addRow(self.chk_quad)
+        f.addRow("Variable", self.cmb_var)
+        f.addRow("Colormap", self.cmb_cmap)
+        lay.addWidget(g)
+
+        # Truncation
+        g = QGroupBox("3 · Spectral truncation")
+        v = QVBoxLayout(g)
+        self.lbl_keep = QLabel()
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(1, 16)
+        self.slider.setToolTip(
+            "Zeroes out learned spectral weights outside |kx|,|ky| <= keep and "
+            "re-runs the network. This is a real architectural ablation."
+        )
+        self.slider.valueChanged.connect(self._on_keep_changed)
+        row = QHBoxLayout()
+        self.btn_sweep = QPushButton("▶ Sweep")
+        self.btn_sweep.setCheckable(True)
+        self.btn_sweep.toggled.connect(self._toggle_sweep)
+        row.addWidget(self.slider, 1)
+        row.addWidget(self.btn_sweep)
+        v.addWidget(self.lbl_keep)
+        v.addLayout(row)
+        hint = QLabel("Low modes → smooth, low-frequency solution.\n"
+                      "High modes → fine detail (and learned noise).")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("font-size:10px; opacity:0.7;")
+        v.addWidget(hint)
+        lay.addWidget(g)
+
+        # Metrics
+        g = QGroupBox("4 · Metrics")
+        grid = QGridLayout(g)
+        self.metric_labels = {}
+        for i, (name, tip) in enumerate([
+            ("L1", "Mean absolute error."),
+            ("L2", "Root mean squared error."),
+            ("Rel L2", "Relative L2 error — the standard FNO benchmark metric."),
+            ("Max", "Maximum pointwise error."),
+            ("PSNR", "Peak signal-to-noise ratio in dB."),
+            ("Energy", "Fraction of truth spectral energy inside the retained mode box."),
+        ]):
+            lab = QLabel("—")
+            lab.setToolTip(tip)
+            grid.addWidget(QLabel(name), i, 0)
+            grid.addWidget(lab, i, 1)
+            self.metric_labels[name] = lab
+        lay.addWidget(g)
+        lay.addStretch()
+
+        return self._scroll(w)
+
+    def _center_panel(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self.field = FieldCanvas()
+        self.field.mpl_connect("button_press_event", self._on_click)
+
+        self.bottom_tabs = QTabWidget()
+
+        self.slices = SliceCanvas()
+        self.bottom_tabs.addTab(self.slices, "Cross-sections")
+
+        spec_widget = QWidget()
+        sv = QVBoxLayout(spec_widget)
+        sv.setContentsMargins(6, 6, 6, 6)
+        bar = QHBoxLayout()
+        self.cmb_spec_src = QComboBox()
+        self.cmb_spec_src.addItems(["Prediction", "Truth", "Input"])
+        self.cmb_spec_comp = QComboBox()
+        self.cmb_spec_comp.addItems(["Amplitude", "Phase", "Real", "Imag"])
+        self.chk_log = QCheckBox("log amplitude")
+        self.chk_log.setChecked(True)
+        for cb in (self.cmb_spec_src, self.cmb_spec_comp, self.chk_log):
+            cb.currentIndexChanged.connect(self._schedule) if isinstance(cb, QComboBox) \
+                else cb.stateChanged.connect(self._schedule)
+            bar.addWidget(cb)
+        self.spectrum = SpectrumCanvas()
+        sv.addLayout(bar)
+        sv.addWidget(self.spectrum)
+        self.bottom_tabs.addTab(spec_widget, "Fourier spectrum")
+
+        self.hist = HistCanvas()
+        self.bottom_tabs.addTab(self.hist, "Error histogram")
+
+        split = QSplitter(Qt.Orientation.Vertical)
+        split.addWidget(self.field)
+        split.addWidget(self.bottom_tabs)
+        split.setSizes([600, 280])
+        lay.addWidget(split)
+        return w
+
+    def _right_panel(self) -> QWidget:
+        self.right_tabs = QTabWidget()
+
+        # --- Training tab ---
+        tw = QWidget()
+        tv = QVBoxLayout(tw)
+        form_widget = QWidget()
+        form = QFormLayout(form_widget)
+
+        self.spin_epochs = QSpinBox(); self.spin_epochs.setRange(1, 1000); self.spin_epochs.setValue(30)
+        self.spin_width = QSpinBox(); self.spin_width.setRange(4, 64); self.spin_width.setSingleStep(4); self.spin_width.setValue(16)
+        self.spin_modes = QSpinBox(); self.spin_modes.setRange(2, 16); self.spin_modes.setValue(8)
+        self.spin_layers = QSpinBox(); self.spin_layers.setRange(1, 8); self.spin_layers.setValue(4)
+        self.spin_train_n = QSpinBox(); self.spin_train_n.setRange(16, 64); self.spin_train_n.setSingleStep(16); self.spin_train_n.setValue(32)
+        self.spin_batch = QSpinBox(); self.spin_batch.setRange(2, 64); self.spin_batch.setValue(16)
+        self.spin_lr = QDoubleSpinBox(); self.spin_lr.setDecimals(5); self.spin_lr.setSingleStep(0.0001)
+        self.spin_lr.setRange(0.00001, 0.01); self.spin_lr.setValue(0.001)
+        self.cmb_device = QComboBox(); self.cmb_device.addItems(["Auto", "CPU", "CUDA"])
+
+        for lab, wid in [
+            ("Epochs", self.spin_epochs), ("Width", self.spin_width),
+            ("Fourier modes", self.spin_modes), ("FNO layers", self.spin_layers),
+            ("Train grid", self.spin_train_n), ("Batch size", self.spin_batch),
+            ("Learning rate", self.spin_lr), ("Device", self.cmb_device),
+        ]:
+            form.addRow(lab, wid)
+
+        self.btn_train = QPushButton("▶  Train FNO")
+        self.btn_train.clicked.connect(self._start_training)
+        self.btn_stop = QPushButton("■  Stop")
+        self.btn_stop.setObjectName("secondary")
+        self.btn_stop.clicked.connect(lambda: self.worker.request_stop() if self.worker else None)
+        self.btn_stop.setEnabled(False)
+        self.btn_reset = QPushButton("Reset to demo model")
+        self.btn_reset.setObjectName("secondary")
+        self.btn_reset.clicked.connect(self._reset_model)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.loss = LossCanvas()
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(300)
+        self.log.setFixedHeight(120)
+
+        tv.addWidget(self._scroll(form_widget))
+        tv.addWidget(self.btn_train)
+        row = QHBoxLayout()
+        row.addWidget(self.btn_stop)
+        row.addWidget(self.btn_reset)
+        tv.addLayout(row)
+        tv.addWidget(self.progress)
+        tv.addWidget(self.loss, 1)
+        tv.addWidget(QLabel("Training log"))
+        tv.addWidget(self.log)
+
+        if not HAS_TORCH:
+            self.btn_train.setEnabled(False)
+            self.btn_train.setText("▶ Train FNO (install torch)")
+            for wdg in (self.spin_epochs, self.spin_width, self.spin_modes,
+                        self.spin_layers, self.spin_train_n, self.spin_batch,
+                        self.spin_lr, self.cmb_device):
+                wdg.setEnabled(False)
+
+        self.right_tabs.addTab(tw, "Model & training")
+
+        # --- Kernel inspector tab ---
+        kw = QWidget()
+        kv = QVBoxLayout(kw)
+        kf = QFormLayout()
+        self.cmb_layer = QComboBox()
+        self.cmb_in = QComboBox()
+        self.cmb_out = QComboBox()
+        self.cmb_kernel = QComboBox()
+        self.cmb_kernel.addItems(["Magnitude", "Phase"])
+        for cb in (self.cmb_layer, self.cmb_in, self.cmb_out, self.cmb_kernel):
+            cb.currentIndexChanged.connect(self._schedule)
+        kf.addRow("Spectral layer", self.cmb_layer)
+        kf.addRow("In channel", self.cmb_in)
+        kf.addRow("Out channel", self.cmb_out)
+        kf.addRow("Component", self.cmb_kernel)
+        kv.addLayout(kf)
+
+        self.kernel = KernelCanvas()
+        kv.addWidget(self.kernel, 1)
+        note = QLabel(
+            "Each FNO layer learns a complex kernel R(k).\n\n"
+            "The green box marks the modes retained by the truncation slider.\n"
+            "Rows are centered in ky; columns are the non-negative kx half-spectrum.\n\n"
+            "In demo mode an analytic reference kernel is shown instead."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("font-size:10px; opacity:0.75;")
+        kv.addWidget(note)
+        self.right_tabs.addTab(kw, "Learned kernels")
+
+        return self.right_tabs
+
+    # -------------------------------------------------------------- actions
+
+    def _build_actions(self):
+        def add(text, slot, shortcut=None):
+            a = QAction(text, self)
+            a.triggered.connect(slot)
+            if shortcut:
+                a.setShortcut(QKeySequence(shortcut))
+            self.addAction(a)
+            return a
+
+        self.act_sample = add("New sample", lambda: self.spin_sample.setValue(
+            int(np.random.default_rng().integers(0, 9999))), "R")
+        self.act_quad = add("Toggle 2×2 view", lambda: self.chk_quad.toggle(), "G")
+        self.act_quad.setCheckable(True)
+        self.chk_quad.toggled.connect(self.act_quad.setChecked)
+        self.act_sweep = add("Sweep modes", self.btn_sweep.toggle, "Space")
+        self.act_sweep.setCheckable(True)
+        self.btn_sweep.toggled.connect(self.act_sweep.setChecked)
+        self.act_png = add("Export PNG…", self._export_png, "S")
+        self.act_theme = add("Toggle theme", self._toggle_theme, "D")
+
+        m_file = self.menuBar().addMenu("&File")
+        m_file.addAction(add("Export PNG…", self._export_png, "S"))
+        m_file.addAction(add("Export fields (.npz)…", self._export_npz))
+        m_file.addAction(add("Export slice (.csv)…", self._export_csv))
+        m_file.addSeparator()
+        m_file.addAction(add("Save model weights…", self._export_model))
+        m_file.addAction(add("Load model weights…", self._import_model))
+        m_file.addSeparator()
+        m_file.addAction(add("Quit", self.close, "Ctrl+Q"))
+
+        m_view = self.menuBar().addMenu("&View")
+        m_view.addAction(self.act_quad)
+        m_view.addAction(self.act_theme)
+
+        m_help = self.menuBar().addMenu("&Help")
+        m_help.addAction(add("About FNO Studio", self._about, "F1"))
+
+    def _load_settings(self):
+        self.spin_sample.blockSignals(True)
+        self.spin_sample.setValue(self.sample_index)
+        self.spin_sample.blockSignals(False)
+        self.cmb_resolution.setCurrentText(str(self.resolution))
+        self.slider.blockSignals(True)
+        self.slider.setValue(self.keep)
+        self.slider.blockSignals(False)
+        self.cmb_cmap.setCurrentText(self.settings.value("cmap", "viridis"))
+        self.cmb_var.setCurrentIndex(int(self.settings.value("var", 2)))
+        self.chk_quad.setChecked(self.settings.value("quad", False, type=bool))
+
+    # ------------------------------------------------------------- inference
+
+    def _predict(self, sample: Sample, keep: int) -> np.ndarray:
+        if self.model is not None and HAS_TORCH:
+            key = (id(self.model), keep)
+            if key not in self._prune_cache:
+                self._prune_cache[key] = prune_modes(self.model, keep)
+            model = self._prune_cache[key]
+            with torch.no_grad():
+                return model(make_input(sample.a))[0, 0].cpu().numpy()
+        return mock_predict(sample.a, keep)
+
+    def _cached(self, seed: int, n: int, keep: int):
+        key = (seed, n, keep, id(self.model))
+        if key not in self._cache:
+            sample = self.op.sample(seed, n)
+            pred = self._predict(sample, keep)
+            self._cache[key] = (sample, pred)
+            if len(self._cache) > 24:
+                self._cache.pop(next(iter(self._cache)))
+        return self._cache[key]
+
+    def _schedule(self):
+        self._refresh_timer.start()
+
+    def _on_sample_changed(self, v):
+        self.sample_index = v
+        self.cursor = None
+        self._schedule()
+
+    def _on_resolution_changed(self, text):
+        self.resolution = int(text)
+        self.cursor = None
+        self._schedule()
+
+    def _on_keep_changed(self, v):
+        self.keep = v
+        self._schedule()
+
+    def _on_view_changed(self):
+        self.cmb_var.setEnabled(not self.chk_quad.isChecked())
+        self.field.set_quad(self.chk_quad.isChecked(), self.dark)
+        self._schedule()
+
+    def _on_click(self, event):
+        if event.inaxes not in self.field.axes or event.xdata is None:
+            return
+        n = self.resolution
+        col = int(np.clip(event.xdata * n, 0, n - 1))
+        row = int(np.clip(event.ydata * n, 0, n - 1))
+        self.cursor = (col, row)
+        self.refresh()
+
+    # -------------------------------------------------------------- refresh
+
+    def refresh(self):
+        if self._closing:
+            return
+        self.sample, self.pred = self._cached(
+            self.sample_index, self.resolution, self.keep)
+        u, a, p = self.sample.u, self.sample.a, self.pred
+        err = np.abs(u - p)
+        m = metrics(u, p, self.keep)
+
+        for name, lab in self.metric_labels.items():
+            val = m[name]
+            lab.setText(f"{val * 100:.2f} %" if name == "Energy" else f"{val:.5f}")
+
+        cmap = self.cmb_cmap.currentText()
+        if self.chk_quad.isChecked():
+            fields = [a, u, p, err]
+            titles = ["Input a(x)", "Ground truth u(x)",
+                      f"Prediction  (|k| ≤ {self.keep})", "Absolute error"]
+            cmaps = [cmap, cmap, cmap, "hot"]
+        else:
+            idx = self.cmb_var.currentIndex()
+            fields = [[a, u, p, err][idx]]
+            titles = [["Input a(x)", "Ground truth u(x)",
+                       f"Prediction  (|k| ≤ {self.keep})", "Absolute error"][idx]]
+            cmaps = ["hot" if idx == 3 else cmap]
+
+        n = self.resolution
+        self.field.paint(fields, titles, cmaps, self.cursor, n)
+        self.slices.paint(self.sample, p, self.cursor)
+        self.hist.paint(err)
+
+        src = {"Prediction": p, "Truth": u, "Input": a}[self.cmb_spec_src.currentText()]
+        self.spectrum.paint(src, self.keep, self.cmb_spec_comp.currentText(),
+                            self.chk_log.isChecked())
+        self._paint_kernel()
+
+        backend = "PyTorch FNO" if self.model is not None else "Synthetic demo"
+        self.statusBar().showMessage(
+            f"{backend}  |  grid {n}×{n}  |  modes {self.keep}  |  "
+            f"rel-L2 {m['Rel L2']:.4f}  |  "
+            f"cursor {self.cursor if self.cursor else '—'}"
+        )
+
+    def _paint_kernel(self):
+        M = self.model.modes if self.model is not None else self.spin_modes.value()
+        keep = min(self.keep, M)
+        phase = self.cmb_kernel.currentText() == "Phase"
+
+        if self.model is not None and HAS_TORCH:
+            li = self.cmb_layer.currentIndex()
+            ic = self.cmb_in.currentIndex()
+            oc = self.cmb_out.currentIndex()
+            layer = self.model.spectral[max(li, 0)]
+            w1 = layer.w1.detach().cpu().numpy()[ic, oc]
+            w2 = layer.w2.detach().cpu().numpy()[ic, oc]
+            kernel = np.concatenate([w2, w1], axis=0)
+            kernel = np.angle(kernel) if phase else np.abs(kernel)
+            title = f"Layer {li} · {ic} → {oc} · {'phase' if phase else '|weight|'}"
+        else:
+            ky = np.arange(-M, M)
+            kx = np.arange(0, M + 1)
+            KX, KY = np.meshgrid(kx, ky)
+            kernel = 1.0 / (1 + 0.12 * (KX ** 2 + KY ** 2))
+            kernel += 0.06 * np.exp(-((KX - 2) ** 2 + (KY - 1) ** 2) / 3.0)
+            if phase:
+                kernel = np.zeros_like(kernel)
+            title = "Analytic reference kernel (demo)"
+        self.kernel.paint(kernel, M, keep, title, phase)
+
+    def _rebuild_kernel_combos(self):
+        for cb in (self.cmb_layer, self.cmb_in, self.cmb_out):
+            cb.blockSignals(True)
+            cb.clear()
+        if self.model is not None:
+            for i in range(self.model.n_layers):
+                self.cmb_layer.addItem(f"SpectralConv2d #{i}")
+            for i in range(self.model.width):
+                self.cmb_in.addItem(str(i))
+                self.cmb_out.addItem(str(i))
+        for cb in (self.cmb_layer, self.cmb_in, self.cmb_out):
+            cb.blockSignals(False)
+
+    # ------------------------------------------------------------- training
+
+    def _start_training(self):
+        if not HAS_TORCH or (self.worker and self.worker.isRunning()):
+            return
+        cfg = dict(
+            epochs=self.spin_epochs.value(), width=self.spin_width.value(),
+            modes=self.spin_modes.value(), layers=self.spin_layers.value(),
+            train_n=self.spin_train_n.value(), batch=self.spin_batch.value(),
+            lr=self.spin_lr.value(), device=self.cmb_device.currentText(),
+            train_size=128, val_size=32, seed=123,
+        )
+        self.history.clear()
+        self.loss.paint([])
+        self.log.clear()
+        self.worker = TrainingWorker(cfg, self.op)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.snapshot.connect(self._on_snapshot)
+        self.worker.log.connect(lambda s: self.log.appendPlainText(s))
+        self.worker.done.connect(self._on_training_done)
+        self.btn_train.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.progress.setValue(0)
+        self.worker.start()
+
+    def _on_progress(self, epoch, train, val):
+        self.history.append((epoch, max(train, 1e-9), max(val, 1e-9)))
+        self.loss.paint(self.history)
+        self.progress.setValue(int(100 * epoch / max(self.spin_epochs.value(), 1)))
+
+    def _on_snapshot(self, model):
+        if self._closing:
+            return
+        self.model = model
+        self.model_cfg = getattr(model, "_fno_cfg", None)
+        self._prune_cache.clear()
+        self._cache.clear()
+        M = model.modes
+        self.slider.blockSignals(True)
+        self.slider.setRange(1, M)
+        self.slider.setValue(min(self.keep, M))
+        self.keep = self.slider.value()
+        self.slider.blockSignals(False)
+        self._rebuild_kernel_combos()
+        self.refresh()
+
+    def _on_training_done(self, status):
+        self.btn_train.setEnabled(HAS_TORCH)
+        self.btn_stop.setEnabled(False)
+        self.log.appendPlainText(f"Training {status}.")
+
+    def _reset_model(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.request_stop()
+            return
+        self.model = None
+        self.model_cfg = None
+        self._cache.clear()
+        self._prune_cache.clear()
+        self.slider.blockSignals(True)
+        self.slider.setRange(1, 16)
+        self.slider.blockSignals(False)
+        self._rebuild_kernel_combos()
+        self.history.clear()
+        self.loss.paint([])
+        self.refresh()
+        self.log.appendPlainText("Reset to synthetic demo.")
+
+    # --------------------------------------------------------------- extras
+
+    def _toggle_sweep(self, on):
+        if on:
+            self._sweep_timer.start()
+        else:
+            self._sweep_timer.stop()
+
+    def _sweep_step(self):
+        v = self.slider.value()
+        hi = self.slider.maximum()
+        if v >= hi:
+            self._sweep_dir = -1
+        elif v <= 1:
+            self._sweep_dir = 1
+        self.slider.setValue(v + self._sweep_dir)
+
+    def _toggle_theme(self):
+        self.dark = not self.dark
+        self._apply_theme()
+
+    def _apply_theme(self):
+        QApplication.instance().setStyleSheet(DARK_QSS if self.dark else LIGHT_QSS)
+        for canvas in (self.field, self.slices, self.spectrum, self.hist,
+                       self.loss, self.kernel):
+            canvas.restyle(self.dark)
+
+    def _save_path(self, suffix: str, filter_str: str) -> str | None:
+        path, _ = QFileDialog.getSaveFileName(self, "Save", f"fno_{suffix}{suffix and '.' + suffix}", filter_str)
+        return path or None
+
+    def _export_png(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export figure", "fno_field.png", "PNG (*.png)")
+        if path:
+            self.field.fig.savefig(path, dpi=200, bbox_inches="tight",
+                                   facecolor=self.field.fig.get_facecolor())
+            self.statusBar().showMessage(f"Saved {path}", 4000)
+
+    def _export_npz(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export fields", "fno_fields.npz", "NPZ (*.npz)")
+        if path:
+            np.savez(
+                path, a=self.sample.a, u=self.sample.u, pred=self.pred,
+                seed=self.sample_index, resolution=self.resolution, modes=self.keep,
+                metrics=json.dumps(metrics(self.sample.u, self.pred, self.keep)),
+            )
+            self.statusBar().showMessage(f"Saved {path}", 4000)
+
+    def _export_csv(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export slice", "fno_slice.csv", "CSV (*.csv)")
+        if path:
+            n = self.resolution
+            row = n // 2 if self.cursor is None else self.cursor[1]
+            x = np.linspace(0, 1, n, endpoint=False)
+            data = np.column_stack([x, self.sample.a[row], self.sample.u[row], self.pred[row]])
+            np.savetxt(path, data, delimiter=",", fmt="%.8f",
+                       header="x,input,truth,pred", comments="")
+            self.statusBar().showMessage(f"Saved {path}", 4000)
+
+    def _export_model(self):
+        if self.model is None:
+            QMessageBox.information(self, "No model", "Train a model first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save weights", "fno.pt", "Torch (*.pt)")
+        if path:
+            torch.save({"state_dict": self.model.state_dict(), "cfg": self.model_cfg}, path)
+
+    def _import_model(self):
+        if not HAS_TORCH:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Load weights", "", "Torch (*.pt)")
+        if not path:
+            return
+        try:
+            blob = torch.load(path, map_location="cpu", weights_only=True)
+            cfg = blob.get("cfg") or self.model_cfg or dict(
+                width=self.spin_width.value(), modes=self.spin_modes.value(),
+                layers=self.spin_layers.value())
+            model = FNO2d(**cfg)
+            model.load_state_dict(blob["state_dict"])
+            model.eval()
+            model._fno_cfg = cfg
+            self._on_snapshot(model)
+            self.log.appendPlainText(f"Loaded {path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Load failed", str(exc))
+
+    def _about(self):
+        QMessageBox.information(self, "About",
+            "FNO Studio\n\n"
+            "Interactive Fourier Neural Operator workbench.\n"
+            "Space: sweep modes · R: new sample · G: quad view · "
+            "D: theme · S: export PNG\n\n"
+            "Click the 2D field to probe cross-sections.")
+
+    # -------------------------------------------------------------- lifecycle
+
+    def closeEvent(self, event):
+        self._closing = True
+        self._sweep_timer.stop()
+        self.settings.setValue("dark", self.dark)
+        self.settings.setValue("sample", self.sample_index)
+        self.settings.setValue("resolution", self.resolution)
+        self.settings.setValue("keep", self.keep)
+        self.settings.setValue("cmap", self.cmb_cmap.currentText())
+        self.settings.setValue("var", self.cmb_var.currentIndex())
+        self.settings.setValue("quad", self.chk_quad.isChecked())
+        if self.worker and self.worker.isRunning():
+            self.worker.request_stop()
+            if not self.worker.wait(6000):
+                self.worker.terminate()
+                self.worker.wait()
+        event.accept()
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("FNO Studio")
+    app.setOrganizationName("FNOStudio")
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
